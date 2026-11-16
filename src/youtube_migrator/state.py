@@ -17,6 +17,18 @@ class State:
         self.db.execute("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         self.db.commit()
 
+    @staticmethod
+    def peek(path: Path, key: str, default=None):
+        """Read a saved option without creating a journal during preflight/dry-run."""
+        if not path.exists():
+            return default
+        db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            row = db.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+            return json.loads(row[0]) if row else default
+        finally:
+            db.close()
+
     def get(self, key, default=None):
         row = self.db.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
         return json.loads(row[0]) if row else default
@@ -32,11 +44,11 @@ class State:
     def bind(self, backup_id: str, destination: dict):
         binding = {"backup": backup_id, "destination": destination}
         old = self.get("binding")
-        if old and not same_binding(old, binding):
+        if old and old != binding:
             raise UserError(
                 "State belongs to another export or destination. Use a new --state file"
             )
-        # Re-authentication changes the Music fingerprint; record the current one.
+        # Persist the current, validated destination binding.
         self.set("binding", binding)
 
     def summary(self):
@@ -44,19 +56,11 @@ class State:
             key: json.loads(value) for key, value in self.db.execute("SELECT key,value FROM kv")
         }
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
     def close(self):
         self.db.close()
-
-
-def same_binding(old: dict, new: dict) -> bool:
-    """A matching Music handle outranks the credential fingerprint.
-
-    Testing-mode refresh tokens expire after seven days, so re-running Music setup must not
-    orphan a multi-day migration. The fingerprint is only decisive when no handle is returned.
-    """
-    old_dest, new_dest = dict(old["destination"]), dict(new["destination"])
-    handle = old_dest.get("music_channel_handle")
-    if handle and handle == new_dest.get("music_channel_handle"):
-        old_dest.pop("music_credential_fingerprint", None)
-        new_dest.pop("music_credential_fingerprint", None)
-    return old["backup"] == new["backup"] and old_dest == new_dest

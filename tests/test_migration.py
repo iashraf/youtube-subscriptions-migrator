@@ -3,9 +3,9 @@ from copy import deepcopy
 import pytest
 
 from youtube_migrator.errors import AmbiguousError, APIError, QuotaError
-from youtube_migrator.migration import Conflict, Migrator, plan, route
+from youtube_migrator.migration import Conflict, Migrator, plan
 from youtube_migrator.models import Entry, Playlist, merge
-from youtube_migrator.state import State, same_binding
+from youtube_migrator.state import State
 
 
 class Fake:
@@ -185,23 +185,6 @@ def test_verify_order_title_privacy_and_missing(env):
     assert engine(env).verify()["subscriptions"][0]["status"] == "missing"
 
 
-def test_shared_ids_merge_metadata_without_title_deduplication():
-    yt = Playlist("PLsame", "Title", services=["youtube"], entries=[Entry("1", "a")])
-    music = Playlist(
-        "PLsame",
-        "Title",
-        services=["music"],
-        entries=[Entry("2", "a")],
-        metadata={"music": {"tracks": [{"videoId": "a"}]}},
-    )
-    other = Playlist("PLdifferent", "Title", services=["youtube"])
-    playlists, warnings = merge([music, yt, other])
-    assert len(playlists) == 2
-    assert playlists[0].services == ["music", "youtube"]
-    assert playlists[0].entries[0].key == "1"
-    assert not warnings
-
-
 def test_state_binding_survives_reopen(tmp_path):
     path = tmp_path / "state.db"
     state = State(path)
@@ -242,32 +225,6 @@ def test_create_quota_resumes_without_manual_mapping(env):
     assert engine(env).verify()["ok"]
 
 
-def test_music_only_import_duplicate_tracks(env):
-    backup, state, client = env
-    backup["subscriptions"] = []
-    backup["playlists"][0]["services"] = ["music"]
-    migrator = Migrator(backup, state, music=client, settle=())
-    migrator.run()
-    migrator.run()
-    assert client.adds == 3
-    assert migrator.verify()["ok"]
-
-
-def test_shared_playlist_created_once_and_verified_through_both(env):
-    backup, state, client = env
-    p = backup["playlists"][0]
-    p["services"] = ["youtube", "music"]
-    p["metadata"]["music"] = {"tracks": [{"videoId": e["video_id"]} for e in p["entries"]]}
-    migrator = Migrator(backup, state, client, client, settle=())
-    migrator.run()
-    assert client.creates == 1
-    assert state.get("playlist:PLsource")["via"] == "music"
-    report = migrator.verify()["playlists"][0]
-    assert report["music_sequence_matches"] and report["youtube_sequence_matches"]
-    p["metadata"]["music"]["tracks"].pop()
-    assert not migrator.verify()["ok"]
-
-
 def test_destination_unavailable_is_not_success(env):
     engine(env).run()
     env[2].remote["PLtarget"].entries[0].available = False
@@ -305,54 +262,6 @@ def test_permission_error_stops_without_marking_permanent_entry_failure(env):
     assert "pending" not in record
     engine(env).run()
     assert engine(env).verify()["ok"]
-
-
-def test_dedup_does_not_mutate_service_snapshots():
-    yt = Playlist("PLsame", "Title", services=["youtube"])
-    music = Playlist("PLsame", "Title", services=["music"])
-    result, _ = merge([yt, music])
-    assert result[0].services == ["music", "youtube"]
-    assert yt.services == ["youtube"]
-    assert music.services == ["music"]
-
-
-def shared(p, music_ids=None):
-    p = Playlist.load(p.dump() if isinstance(p, Playlist) else p)
-    p.services = ["music", "youtube"]
-    ids = music_ids if music_ids is not None else [e.video_id for e in p.entries]
-    p.metadata["music"] = {"tracks": [{"videoId": v} for v in ids]}
-    return p
-
-
-def test_routing_prefers_music_only_when_views_match(env):
-    p = Playlist.load(env[0]["playlists"][0])
-    assert route(p) == "youtube"
-    assert route(shared(p)) == "music"
-    assert route(shared(p, ["abcdefghijk"])) == "youtube"
-    assert route(shared(p), music=False) == "youtube"
-    wl = Playlist("watch-later", "WL", services=["watch_later"])
-    assert route(wl) == "youtube"
-    assert route(Playlist("PLm", "M", services=["music"]), music=False) is None
-
-
-def test_shared_playlist_written_via_music_uses_no_youtube_client(env):
-    backup, state, music = env
-    backup["playlists"][0] = shared(backup["playlists"][0]).dump()
-    youtube = Fake()
-    youtube.subs = {"UCchannel"}
-    migrator = Migrator(backup, state, youtube, music, settle=())
-    migrator.run()
-    assert music.creates == 1 and music.adds == 3
-    assert youtube.creates == youtube.adds == 0
-    assert state.get("playlist:PLsource")["via"] == "music"
-
-
-def test_divergent_shared_playlist_stays_on_youtube(env):
-    backup, state, youtube = env
-    backup["playlists"][0] = shared(backup["playlists"][0], ["abcdefghijk"]).dump()
-    music = Fake()
-    Migrator(backup, state, youtube, music, settle=()).run()
-    assert youtube.adds == 3 and music.adds == 0
 
 
 def test_listing_lag_is_settled_instead_of_pausing(env, monkeypatch):
@@ -451,16 +360,6 @@ def test_max_subscriptions_caps_attempts(env):
     assert engine(env).verify()["ok"]
 
 
-def test_subscribe_via_music_confirms_through_youtube(env):
-    backup, state, youtube = env
-    backup["playlists"] = []
-    music = Fake()
-    music.subs = youtube.subs  # same Google account seen through both services
-    Migrator(backup, state, youtube, music, settle=(), subscribe_via="music").run()
-    assert music.subscribed == ["UCchannel"] and youtube.subscribed == []
-    assert state.get("subscription:UCchannel")["status"] == "migrated"
-
-
 def test_continue_on_conflict_still_runs_subscriptions(env):
     backup, state, client = env
     engine(env).run()
@@ -472,34 +371,97 @@ def test_continue_on_conflict_still_runs_subscriptions(env):
     assert "paused" in state.get("status")
 
 
-def test_music_binding_survives_reauthentication():
-    old = {
-        "backup": "g",
-        "destination": {"music_channel_handle": "@new", "music_credential_fingerprint": "a"},
-    }
-    new = {
-        "backup": "g",
-        "destination": {"music_channel_handle": "@new", "music_credential_fingerprint": "b"},
-    }
-    assert same_binding(old, new)
-    other = {
-        "backup": "g",
-        "destination": {"music_channel_handle": "@x", "music_credential_fingerprint": "a"},
-    }
-    assert not same_binding(old, other)
-    no_handle = {"backup": "g", "destination": {"music_credential_fingerprint": "a"}}
-    assert not same_binding(
-        no_handle, {"backup": "g", "destination": {"music_credential_fingerprint": "b"}}
+def test_source_public_playlist_becomes_private_without_changing_backup(env):
+    env[0]["playlists"][0]["privacy"] = "public"
+    engine(env).run()
+    assert env[2].remote["PLtarget"].privacy == "private"
+    assert env[0]["playlists"][0]["privacy"] == "public"
+    assert env[1].get("playlist:PLsource")["privacy"] == "private"
+    assert engine(env).verify()["ok"]
+
+
+def test_unlisted_policy_is_saved_and_reused_on_resume_and_verify(env):
+    engine(env, playlist_privacy="unlisted").run()
+    assert env[2].remote["PLtarget"].privacy == "unlisted"
+    engine(env).run()
+    assert env[2].creates == 1
+    assert env[1].get("playlist_privacy") == "unlisted"
+    assert engine(env).verify()["ok"]
+    with pytest.raises(Exception, match="already fixed"):
+        engine(env, playlist_privacy="private")
+
+
+def test_public_policy_is_rejected_before_remote_writes(env):
+    with pytest.raises(Exception, match="public creation is forbidden"):
+        engine(env, playlist_privacy="public")
+    assert env[2].creates == env[2].adds == 0
+
+
+def test_watch_later_is_a_regular_private_playlist_even_with_unlisted_policy(env):
+    raw = env[0]["playlists"][0]
+    raw.update(
+        {
+            "id": "watch-later",
+            "title": "Watch Later (Migrated)",
+            "services": ["watch_later"],
+            "privacy": "public",
+        }
     )
+    engine(env, playlist_privacy="unlisted").run()
+    assert env[2].remote["PLtarget"].title == "Watch Later (Migrated)"
+    assert env[2].remote["PLtarget"].privacy == "private"
+    assert engine(env).verify()["ok"]
 
 
-def test_plan_routes_and_estimates_days(env):
+def test_duplicate_positions_resume_after_third_remote_write_without_appending_twice(env):
+    from unittest.mock import MagicMock
+
+    raw = env[0]["playlists"][0]
+    ordered = ["abcdefghijk", "ABCDEFGHIJK", "abcdefghijk", "12345678901"]
+    raw["entries"] = [Entry(f"entry-{i}", vid).__dict__ for i, vid in enumerate(ordered)]
+    client = env[2]
+    original = client.add
+
+    def interrupted_add(*args):
+        original(*args)
+        if client.adds == 3:
+            raise KeyboardInterrupt()
+
+    client.add = MagicMock(side_effect=interrupted_add)
+    with pytest.raises(KeyboardInterrupt):
+        engine(env).run()
+    engine(env).run()
+    assert [e.video_id for e in client.remote["PLtarget"].entries] == ordered
+    assert [c.args[2] for c in client.add.call_args_list] == [0, 1, 2, 3]
+    assert client.creates == 1
+    assert engine(env).verify()["ok"]
+
+
+def test_no_append_to_an_existing_public_destination(env):
+    engine(env).run()
+    env[2].remote["PLtarget"].privacy = "public"
+    before = env[2].adds
+    with pytest.raises(Conflict, match="privacy changed"):
+        engine(env).run()
+    assert env[2].adds == before
+    assert not engine(env).verify()["ok"]
+
+
+def test_playlist_deduplication_uses_ids_and_leaves_snapshots_untouched():
+    first = Playlist("PLsame", "Same title", services=["youtube"], entries=[Entry("e1", "a")])
+    second = Playlist("PLsame", "Same title", services=["youtube"], entries=[Entry("e2", "a")])
+    other = Playlist("PLdifferent", "Same title", services=["youtube"])
+    playlists, warnings = merge([first, second, other])
+    assert len(playlists) == 2
+    assert playlists[0].entries[0].key == "e1"
+    assert first.entries[0].key == "e1" and second.entries[0].key == "e2"
+    assert not warnings
+
+
+def test_offline_plan_estimates_only_official_api_units(env):
     backup = env[0]
-    backup["manifest"]["services"] = ["youtube", "music"]
     backup["subscriptions"] = [f"UC{i}" for i in range(500)]
-    backup["playlists"] = [shared(backup["playlists"][0]).dump()]
     result = plan(backup)
-    assert result["playlists"][0]["via"] == "music"
-    assert result["estimated_youtube_units"] == 50 * 500 + 2 * 10
+    assert result["estimated_youtube_units"] == 50 * 500 + 20 + 205
     assert result["estimated_days"] == 3
-    assert plan(backup, subscribe_via="music")["estimated_youtube_units"] == 20
+    assert result["playlists"][0]["privacy"] == "private"

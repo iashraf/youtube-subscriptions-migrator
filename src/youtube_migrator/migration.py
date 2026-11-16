@@ -7,6 +7,7 @@ Only a journalled single pending append may explain an extra remote entry.
 import hashlib
 import math
 import time
+from dataclasses import replace
 
 from .errors import AmbiguousError, APIError, QuotaError, UserError
 from .models import Playlist
@@ -33,23 +34,12 @@ def is_auth(exc: APIError) -> bool:
     return exc.status == 401 or exc.reason in AUTH_REASONS
 
 
-def music_view_matches(p: Playlist) -> bool:
-    tracks = p.metadata.get("music", {}).get("tracks")
-    return tracks is not None and [t.get("videoId") for t in tracks] == ids(p.entries)
-
-
-def route(p: Playlist, music: bool = True, youtube: bool = True) -> str | None:
-    """Prefer ytmusicapi, which uses no Data API quota, when its view is the canonical sequence.
-
-    Shared playlists whose Music view differs from YouTube stay on the official API so the
-    written sequence can be confirmed by reading it back. Watch Later always uses YouTube.
-    """
-    if music and "watch_later" not in p.services:
-        if "youtube" not in p.services or music_view_matches(p):
-            return "music"
-    if youtube and ("youtube" in p.services or "watch_later" in p.services):
-        return "youtube"
-    return None
+def allowed_privacy(value: str) -> str:
+    if value not in {"private", "unlisted"}:
+        raise UserError(
+            "Playlist privacy must be private or unlisted; public creation is forbidden"
+        )
+    return value
 
 
 class Migrator:
@@ -58,32 +48,37 @@ class Migrator:
         backup,
         state,
         youtube=None,
-        music=None,
         progress=None,
         *,
-        subscribe_via="youtube",
+        playlist_privacy: str | None = None,
         max_subscriptions=None,
         continue_on_conflict=False,
         settle=SETTLE,
     ):
         self.backup, self.state = backup, state
-        self.youtube, self.music = youtube, music
+        self.youtube = youtube
+        saved_privacy = state.get("playlist_privacy")
+        if saved_privacy and playlist_privacy and saved_privacy != playlist_privacy:
+            raise UserError(
+                "Playlist privacy is already fixed in this journal; resume with its saved policy"
+            )
+        self.playlist_privacy = allowed_privacy(playlist_privacy or saved_privacy or "private")
         self.progress = progress or (lambda message: None)
-        self.subscribe_via = subscribe_via
         self.max_subscriptions = max_subscriptions
+        self.subscription_batch_limited = False
         self.continue_on_conflict = continue_on_conflict
         self.settle = settle
 
-    def via(self, p):
-        record = self.state.get("playlist:" + p.id) or {}
-        return record.get("via") or route(p, self.music is not None, self.youtube is not None)
+    def target_privacy(self, p, record=None):
+        record = record or {}
+        if "watch_later" in p.services:
+            return "private"
+        return allowed_privacy(record.get("privacy") or self.playlist_privacy)
 
-    def client(self, p, via=None):
-        via = via or self.via(p)
-        client = {"music": self.music, "youtube": self.youtube}.get(via)
-        if client is None:
-            raise UserError(f"Missing destination {via or 'service'} credentials for {p.id}")
-        return client
+    def client(self):
+        if self.youtube is None:
+            raise UserError("Destination YouTube credentials required for video playlists")
+        return self.youtube
 
     def settled(self, read, expected):
         """Re-read with short waits; a confirmed write can take a moment to appear in lists."""
@@ -105,11 +100,10 @@ class Migrator:
         marker = self.marker(p.id)
         if not record:
             record = {"status": "new", "destination": None, "done": [], "failed": {}}
-        # The route is fixed when first journalled so a resume never switches services.
-        if not record.get("via"):
-            record["via"] = route(p, self.music is not None, self.youtube is not None)
-            self.state.set(key, record)
-        client = self.client(p, record["via"])
+        client = self.client()
+        record["privacy"] = self.target_privacy(p, record)
+        self.state.set(key, record)
+        p = replace(p, privacy=record["privacy"])
         if record["destination"] is None and record["status"] in {"new", "create_retry"}:
             record["status"] = "creating"
             self.state.set(key, record)
@@ -196,7 +190,7 @@ class Migrator:
                     self.state.set(key, record)
                     raise
                 if exc.status == 0:
-                    # Unknown Music errors may occur after a successful remote write.
+                    # An unknown transport error may occur after a successful remote write.
                     raise AmbiguousError(exc.reason) from None
                 record.pop("pending")
                 record["failed"][str(i)] = {"status": "failed", "reason": exc.reason}
@@ -221,9 +215,7 @@ class Migrator:
             return
         if self.youtube is None:
             raise UserError("Destination YouTube credentials required for subscriptions")
-        writer = self.music if self.subscribe_via == "music" else self.youtube
-        if writer is None:
-            raise UserError("--subscribe-via music requires destination Music credentials")
+        writer = self.youtube
         existing = self.youtube.subscriptions()
         attempts = 0
         for n, channel in enumerate(channels, 1):
@@ -237,9 +229,10 @@ class Migrator:
             if recorded in {"failed", "skipped"}:
                 continue
             if self.max_subscriptions is not None and attempts >= self.max_subscriptions:
+                self.subscription_batch_limited = True
                 continue
             attempts += 1
-            self.state.set(key, {"status": "pending", "via": self.subscribe_via})
+            self.state.set(key, {"status": "pending"})
             try:
                 writer.subscribe(channel)
             except QuotaError:
@@ -250,7 +243,7 @@ class Migrator:
                 continue
             except APIError as exc:
                 if exc.reason == "subscriptionDuplicate":
-                    self.state.set(key, {"status": "sent", "via": self.subscribe_via})
+                    self.state.set(key, {"status": "sent"})
                     continue
                 if is_auth(exc):
                     self.state.set(key, {"status": "retry"})
@@ -266,7 +259,7 @@ class Migrator:
                     "If YouTube is throttling subscriptions, wait a few hours and run resume; "
                     f"if this channel cannot be subscribed, run skip-subscription {channel}"
                 ) from None
-            self.state.set(key, {"status": "sent", "via": self.subscribe_via})
+            self.state.set(key, {"status": "sent"})
             self.progress(f"Subscription sent: {channel} ({n}/{len(channels)})")
         # One list pass confirms every write instead of a per-channel read.
         unconfirmed = [
@@ -299,10 +292,12 @@ class Migrator:
             self.progress(f"Skipped after conflict: {exc}")
 
     def run(self):
+        self.subscription_batch_limited = False
         skipped = []
         try:
-            # Playlists first: Music-routed playlists need no Data API quota, so they complete
-            # even if subscriptions later exhaust the day's allocation.
+            if self.backup["playlists"]:
+                self.state.set("playlist_privacy", self.playlist_privacy)
+            # Complete each playlist serially before moving on to preserve entry positions.
             for raw in self.backup["playlists"]:
                 p = Playlist.load(raw)
                 self.guarded(skipped, lambda p=p: self.playlist(p))
@@ -319,7 +314,10 @@ class Migrator:
                 if key.startswith(("playlist:", "subscription:"))
             )
             self.state.set(
-                "status", f"finished with {failures} failed/unavailable entries; run verify"
+                "status",
+                "paused: subscription batch limit reached; run resume to continue"
+                if self.subscription_batch_limited
+                else f"finished with {failures} failed/unavailable entries; run verify",
             )
         except QuotaError as exc:
             self.state.set("status", "paused: quota exhausted; run resume when quota is available")
@@ -330,7 +328,17 @@ class Migrator:
             raise
 
     def verify(self):
-        report = {"subscriptions": [], "playlists": [], "ok": True}
+        source_partial = self.backup["manifest"].get("completeness") == "partial"
+        subscription_scope = self.backup.get("migration_scope") == "subscriptions"
+        report = {
+            "scope": "subscriptions" if subscription_scope else "all_exported_data",
+            "excluded_playlists": self.backup.get("excluded_playlists", 0),
+            "subscriptions": [],
+            "playlists": [],
+            "ok": subscription_scope or not source_partial,
+            "source_export_completeness": self.backup["manifest"].get("completeness", "unknown"),
+            "source_export_warnings": self.backup["manifest"].get("warnings", []),
+        }
         if self.backup["subscriptions"]:
             try:
                 actual = self.youtube.subscriptions()
@@ -368,22 +376,23 @@ class Migrator:
             "source_id": p.id,
             "destination_id": record.get("destination"),
             "services": p.services,
-            "via": record.get("via"),
             "status": "missing",
             "entries": [],
             "source_count": len(p.entries),
         }
         if record.get("destination"):
             try:
-                via = self.via(p)
-                remote = self.client(p, via).playlist(record["destination"])
+                target_privacy = self.target_privacy(p, record)
+                remote = self.client().playlist(record["destination"])
                 actual = ids(remote.entries)
                 expected = ids(p.entries)
                 item.update(
                     {
                         "destination_count": len(actual),
                         "title_matches": p.title == remote.title,
-                        "privacy_matches": p.privacy == remote.privacy,
+                        "source_privacy": p.privacy,
+                        "expected_privacy": target_privacy,
+                        "privacy_matches": target_privacy == remote.privacy,
                         "description_matches": remote.description
                         in {p.description, p.description + "\n" + self.marker(p.id)},
                         "sequence_matches": expected == actual,
@@ -417,9 +426,6 @@ class Migrator:
                     and all(e["status"] == "migrated" for e in item["entries"])
                     else "discrepancy"
                 )
-                # A shared playlist must also be visible and ordered correctly in both services.
-                if set(p.services) >= {"youtube", "music"}:
-                    self.verify_views(p, record["destination"], via, remote, item)
             except APIError as exc:
                 item["status"] = "missing" if exc.status == 404 else "not_verifiable"
                 item["reason"] = exc.reason
@@ -440,72 +446,45 @@ class Migrator:
             ]
         return item
 
-    def verify_views(self, p, destination, via, primary, item):
-        sources = {
-            "youtube": ids(p.entries),
-            "music": [t.get("videoId") for t in p.metadata["music"].get("tracks", [])],
-        }
-        for service, source in sources.items():
-            try:
-                view = primary if service == via else self.client(p, service).playlist(destination)
-            except (APIError, UserError):
-                item[f"{service}_status"] = "not_verifiable"
-                item["status"] = "not_verifiable"
-                continue
-            item[f"{service}_sequence_matches"] = ids(view.entries) == source
-            item[f"{service}_unavailable_positions"] = [
-                i for i, e in enumerate(view.entries) if not e.available
-            ]
-            if (
-                not item[f"{service}_sequence_matches"] or item[f"{service}_unavailable_positions"]
-            ) and item["status"] == "migrated":
-                item["status"] = "discrepancy"
 
-
-def plan(backup: dict, subscribe_via: str = "youtube", daily_quota: int = 10_000) -> dict:
-    """Offline upper-bound estimate; assumes destination credentials for every exported service."""
-    services = backup["manifest"]["services"]
-    has_music = "music" in services
-    has_youtube = "youtube" in services or "watch_later" in services
+def plan(backup: dict, daily_quota: int = 10_000, playlist_privacy: str = "private") -> dict:
+    """Estimate official API writes and paginated confirmation reads without authentication."""
+    allowed_privacy(playlist_privacy)
+    if daily_quota <= 0:
+        raise UserError("Daily quota must be positive")
     subscriptions = len(backup["subscriptions"])
-    units = music_requests = 0
-    if subscriptions:
-        # Initial subscription listing plus one confirmation pass, 50 per page.
-        units += 2 * math.ceil(subscriptions / 50)
-        if subscribe_via == "youtube":
-            units += 50 * subscriptions
-        else:
-            music_requests += subscriptions
+    units = 2 * math.ceil(subscriptions / 50) + 50 * subscriptions
     rows = []
     for raw in backup["playlists"]:
         p = Playlist.load(raw)
-        via = route(p, has_music, has_youtube)
         n = sum(bool(e.available and e.video_id) for e in p.entries)
-        row_units = 0
-        if via == "youtube":
-            # Create, initial read, then each insert plus a paginated read-back of the playlist.
-            row_units = 50 + 2 + sum(50 + math.ceil(k / 50) for k in range(1, n + 1))
-        else:
-            music_requests += 2 + 2 * n
-        units += row_units
-        rows.append({"title": p.title, "via": via, "entries": n, "youtube_units": row_units})
+        cost = 50 + 2 + sum(50 + math.ceil(k / 50) for k in range(1, n + 1))
+        units += cost
+        rows.append(
+            {
+                "title": p.title,
+                "entries": n,
+                "youtube_units": cost,
+                "privacy": "private" if "watch_later" in p.services else playlist_privacy,
+            }
+        )
     return {
         "mode": "offline upper-bound plan; destination not inspected",
+        "scope": backup.get("migration_scope", "all"),
+        "excluded_playlists": backup.get("excluded_playlists", 0),
         "subscriptions": subscriptions,
-        "subscribe_via": subscribe_via,
         "playlists": rows,
         "entries": sum(len(p["entries"]) for p in backup["playlists"]),
         "estimated_youtube_units": units,
         "assumed_daily_quota": daily_quota,
         "estimated_days": math.ceil(units / daily_quota) if units else 0,
-        "music_requests": music_requests,
-        "note": "Existing destination state reduces writes; settle re-reads and retries add "
-        "units. Music requests use no Data API quota; their limits are undocumented.",
+        "note": "Existing subscriptions and journal entries reduce writes; settle reads and "
+        "retries add units. Every playlist insertion includes an ordered read-back.",
     }
 
 
 def summarize(report: dict) -> dict:
-    """Counts retain separate views for shared YouTube/Music playlists."""
+    """Report subscription, video playlist, and regular Watch Later copy results."""
     result = {}
     subscriptions = report["subscriptions"]
     result["subscriptions"] = {
@@ -516,7 +495,7 @@ def summarize(report: dict) -> dict:
             for status in {s["status"] for s in subscriptions}
         },
     }
-    for service in ("youtube", "music", "watch_later"):
+    for service in ("youtube", "watch_later"):
         playlists = [p for p in report["playlists"] if service in p["services"]]
         entries = [e for p in playlists for e in p["entries"]]
         result[service] = {

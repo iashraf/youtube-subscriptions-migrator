@@ -3,6 +3,8 @@
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 
+from .errors import InputError
+
 
 @dataclass
 class Entry:
@@ -27,7 +29,12 @@ class Playlist:
 
     @classmethod
     def load(cls, value: dict) -> "Playlist":
-        return cls(**{**value, "entries": [Entry(**e) for e in value["entries"]]})
+        services = value.get("services", ["youtube"])
+        if not services or not set(services) <= {"youtube", "watch_later"}:
+            raise InputError("Unsupported playlist type; use a YouTube export")
+        return cls(
+            **{**value, "services": services, "entries": [Entry(**e) for e in value["entries"]]}
+        )
 
 
 def merge(playlists: list[Playlist]) -> tuple[list[Playlist], list[str]]:
@@ -42,11 +49,5 @@ def merge(playlists: list[Playlist]) -> tuple[list[Playlist], list[str]]:
         old.services = sorted(set(old.services + p.services))
         old.metadata.update(p.metadata)
         if [e.video_id for e in old.entries] != [e.video_id for e in p.entries]:
-            warnings.append(
-                f"Shared playlist {p.id}: service contents differ; YouTube is canonical"
-            )
-        if "youtube" in p.services:
-            p.services = old.services
-            p.metadata = old.metadata
-            result[p.id] = p
+            warnings.append(f"Conflicting snapshots for playlist {p.id}; first sequence retained")
     return list(result.values()), warnings

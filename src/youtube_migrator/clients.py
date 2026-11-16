@@ -7,7 +7,7 @@ from googleapiclient.discovery import build
 from .errors import APIError, Caller, InputError, UserError
 from .models import Entry, Playlist
 
-AUTOMATIC_PLAYLISTS = {"LM", "LL", "WL", "SE"}
+AUTOMATIC_PLAYLISTS = {"LL", "WL"}
 
 
 class YouTube:
@@ -34,10 +34,23 @@ class YouTube:
             if not token:
                 return result
 
-    def identity(self) -> str:
+    def identity(self, allow_missing: bool = False) -> str | None:
         channels = self.pages("channels", part="id", mine=True)
+        if not channels:
+            if allow_missing:
+                return None
+            raise UserError(
+                "Google returned no YouTube channel ID. This playlist import requires a "
+                "verifiable destination channel. To proceed without a channel, run import "
+                "--subscriptions-only using the same export and journal. This skips all "
+                "playlist creation, including Watch Later. No new export is needed."
+            )
         if len(channels) != 1:
-            raise UserError("Expected one authenticated YouTube channel; select a channel at setup")
+            raise UserError(
+                f"Google returned {len(channels)} channels; refusing to choose one arbitrarily. "
+                "Re-run setup --account source/destination --reauth "
+                "and choose the intended channel."
+            )
         return channels[0]["id"]
 
     def subscriptions(self) -> set[str]:
@@ -98,6 +111,8 @@ class YouTube:
         return result
 
     def create(self, p: Playlist, marker: str) -> str:
+        if p.privacy not in {"private", "unlisted"}:
+            raise InputError("Created playlists must be private or unlisted; public is forbidden")
         if len(p.description + "\n" + marker) > 5000:
             raise InputError(
                 "Description plus recovery marker exceeds 5000 characters. "
@@ -136,87 +151,3 @@ class YouTube:
             write=True,
             units=50,
         )
-
-
-class Music:
-    def __init__(self, api, caller=None, progress=None):
-        self.api, self.caller = api, caller or Caller()
-        self.warnings: list[str] = []
-        self.progress = progress or (lambda message: None)
-
-    def identity(self) -> dict:
-        info = self.caller.call(self.api.get_account_info)
-        return {
-            "channel_handle": info.get("channelHandle"),
-            "account_name": info.get("accountName"),
-        }
-
-    def playlists(self) -> list[Playlist]:
-        library = self.caller.call(lambda: self.api.get_library_playlists(limit=None))
-        library = [p for p in library if p.get("playlistId") not in AUTOMATIC_PLAYLISTS]
-        for p in library:
-            if "owned" not in p:
-                self.warnings.append(
-                    f"Music playlist {p.get('playlistId')}: ownership unknown; excluded"
-                )
-        playlists = []
-        for p in library:
-            if p.get("owned") is True:
-                playlists.append(self.playlist(p["playlistId"]))
-                self.progress(f"Music playlist read: {p['playlistId']}")
-        return playlists
-
-    def entries(self, pid: str) -> list[Entry]:
-        return self.playlist(pid).entries
-
-    def subscribe(self, channel: str):
-        """Uses the web client's subscribe endpoint; consumes no Data API quota.
-
-        Confirmation comes from a later Data API subscription listing, never this response.
-        """
-        result = self.caller.call(lambda: self.api.subscribe_artist(channel), write=True)
-        if not isinstance(result, dict):
-            raise APIError("musicSubscribeRejected")
-        return result
-
-    def playlist(self, pid: str) -> Playlist:
-        raw = self.caller.call(lambda: self.api.get_playlist(pid, limit=None))
-        if not isinstance(raw, dict) or "tracks" not in raw:
-            raise APIError("invalidMusicPlaylist")
-        entries = [
-            Entry(
-                t.get("setVideoId") or f"{pid}:{i}",
-                t.get("videoId"),
-                bool(t.get("videoId")) and t.get("isAvailable", True),
-                t,
-            )
-            for i, t in enumerate(raw["tracks"])
-        ]
-        return Playlist(
-            pid,
-            raw["title"],
-            raw.get("description") or "",
-            (raw.get("privacy") or "private").lower(),
-            ["music"],
-            entries,
-            {"music": raw},
-        )
-
-    def create(self, p: Playlist, marker: str) -> str:
-        result = self.caller.call(
-            lambda: self.api.create_playlist(
-                p.title, p.description + "\n" + marker, privacy_status=p.privacy.upper()
-            ),
-            write=True,
-        )
-        if not isinstance(result, str) or not result.startswith("PL"):
-            raise APIError("musicCreateRejected")
-        return result
-
-    def add(self, pid: str, video_id: str, position: int):
-        result = self.caller.call(
-            lambda: self.api.add_playlist_items(pid, [video_id], duplicates=True), write=True
-        )
-        if not isinstance(result, dict) or result.get("status") != "STATUS_SUCCEEDED":
-            raise APIError("musicInsertRejected")
-        return result

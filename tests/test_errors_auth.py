@@ -74,13 +74,36 @@ def test_desktop_loopback_flow_and_write_scope(flow, tmp_path):
     assert not args["open_browser"]
 
 
-def test_music_http_status_survives_sdk_error_wrapping():
-    from ytmusicapi.exceptions import YTMusicServerError
-
-    fn = MagicMock(
-        side_effect=YTMusicServerError("Server returned HTTP 503: unavailable.\nprivate")
+@patch("youtube_migrator.authentication.InstalledAppFlow")
+@patch("youtube_migrator.authentication.Credentials")
+def test_reauth_bypasses_saved_token_without_deleting_it(credentials, flow, tmp_path):
+    path = tmp_path / "source_youtube_token.json"
+    old = {"scopes": [READ], "refresh_token": "fictional-old-token"}
+    atomic(path, old)
+    candidate = flow.from_client_secrets_file.return_value.run_local_server.return_value
+    candidate.to_json.return_value = json.dumps(
+        {"scopes": [READ], "refresh_token": "fictional-new"}
     )
-    with pytest.raises(AmbiguousError) as caught:
-        Caller(0).call(fn, write=True)
-    assert caught.value.status == 503
-    assert "private" not in str(caught.value)
+    youtube_credentials(tmp_path, "source", setup=True, force_reauth=True)
+    credentials.from_authorized_user_info.assert_not_called()
+    assert read(path)["refresh_token"] == "fictional-new"
+
+
+@patch("youtube_migrator.authentication.InstalledAppFlow")
+def test_failed_reauth_preserves_previous_token(flow, tmp_path):
+    path = tmp_path / "source_youtube_token.json"
+    old = {"scopes": [READ], "refresh_token": "fictional-old-token"}
+    atomic(path, old)
+    flow.from_client_secrets_file.return_value.run_local_server.side_effect = TimeoutError()
+    with pytest.raises(TimeoutError):
+        youtube_credentials(tmp_path, "source", setup=True, force_reauth=True)
+    assert read(path) == old
+
+
+def test_parser_error_has_safe_operation_context_without_response_details():
+    fn = MagicMock(side_effect=KeyError("fictional-private-response"))
+    with pytest.raises(APIError) as exc:
+        Caller(0).call(fn, operation="YouTube playlist listing")
+    assert exc.value.operation == "YouTube playlist listing"
+    assert "YouTube playlist listing" in str(exc.value)
+    assert "fictional-private-response" not in str(exc.value)

@@ -21,7 +21,7 @@ def video_id(value: str) -> str:
     if ID.fullmatch(value):
         return value
     url = urlparse(value)
-    if url.hostname in {"youtube.com", "www.youtube.com", "music.youtube.com", "youtu.be"}:
+    if url.hostname in {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"}:
         candidate = (
             url.path.strip("/")
             if url.hostname == "youtu.be"

@@ -2,7 +2,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from youtube_migrator.clients import Music, YouTube
+from youtube_migrator.clients import YouTube
 from youtube_migrator.errors import Caller
 
 
@@ -48,39 +48,82 @@ def test_youtube_order_unavailable_and_duplicates():
     assert len(entries) == 3
 
 
-def test_music_ownership_unlimited_and_duplicates():
+@pytest.mark.parametrize("allow_missing", [False, True])
+def test_no_channel_is_allowed_only_for_source_reads(allow_missing):
+    from youtube_migrator.errors import UserError
+
     api = MagicMock()
-    api.get_library_playlists.return_value = [
-        {"playlistId": "PLowned", "owned": True},
-        {"playlistId": "PLsaved", "owned": False},
-        {"playlistId": "LM", "owned": True},
-        {"playlistId": "SE", "owned": True},
-        {"playlistId": "PLunknown"},
-    ]
-    api.get_playlist.return_value = {
-        "title": "Songs",
-        "tracks": [
-            {"videoId": "abcdefghijk", "setVideoId": "1"},
-            {"videoId": "abcdefghijk", "setVideoId": "2"},
-        ],
+    api.channels.return_value.list.return_value.execute.return_value = {"items": []}
+    client = YouTube(api=api, caller=Caller(0))
+    if allow_missing:
+        assert client.identity(allow_missing=True) is None
+    else:
+        with pytest.raises(UserError, match="playlist import requires"):
+            client.identity()
+
+
+def test_multiple_channels_are_never_chosen_arbitrarily():
+    from youtube_migrator.errors import UserError
+
+    api = MagicMock()
+    api.channels.return_value.list.return_value.execute.return_value = {
+        "items": [{"id": "UCone"}, {"id": "UCtwo"}]
     }
-    client = Music(api, Caller(0))
-    playlists = client.playlists()
-    assert len(playlists) == 1
-    assert len(playlists[0].entries) == 2
-    api.get_library_playlists.assert_called_once_with(limit=None)
-    api.get_playlist.assert_called_once_with("PLowned", limit=None)
-    api.add_playlist_items.return_value = {"status": "STATUS_SUCCEEDED"}
-    client.add("PLtarget", "abcdefghijk", 0)
-    api.add_playlist_items.assert_called_once_with("PLtarget", ["abcdefghijk"], duplicates=True)
+    with pytest.raises(UserError, match="returned 2 channels"):
+        YouTube(api=api, caller=Caller(0)).identity(allow_missing=True)
 
 
-def test_music_subscribe_is_a_single_unretried_write():
+@pytest.mark.parametrize("privacy", ["private", "unlisted"])
+def test_creation_sets_only_nonpublic_privacy(privacy):
+    from youtube_migrator.models import Playlist
+
     api = MagicMock()
-    api.subscribe_artist.return_value = {"actions": []}
-    client = Music(api, Caller(0))
-    client.subscribe("UCchannel")
-    api.subscribe_artist.assert_called_once_with("UCchannel")
-    api.subscribe_artist.return_value = None
-    with pytest.raises(Exception, match="musicSubscribeRejected"):
-        client.subscribe("UCother")
+    api.playlists.return_value.insert.return_value.execute.return_value = {"id": "PLtarget"}
+    client = YouTube(api=api, caller=Caller(0))
+    assert (
+        client.create(Playlist("PLsource", "Video list", privacy=privacy), "marker") == "PLtarget"
+    )
+    body = api.playlists.return_value.insert.call_args.kwargs["body"]
+    assert body["status"]["privacyStatus"] == privacy
+
+
+def test_public_creation_is_rejected_before_any_api_call():
+    from youtube_migrator.errors import InputError
+    from youtube_migrator.models import Playlist
+
+    api = MagicMock()
+    client = YouTube(api=api, caller=Caller(0))
+    with pytest.raises(InputError, match="public is forbidden"):
+        client.create(Playlist("PLsource", "Video list", privacy="public"), "marker")
+    api.playlists.assert_not_called()
+
+
+def test_video_positions_sort_across_pages_without_collapsing_duplicates():
+    api = MagicMock()
+
+    def item(position, vid):
+        return {
+            "id": f"entry-{position}",
+            "snippet": {"position": position, "title": "Video", "resourceId": {"videoId": vid}},
+        }
+
+    api.playlistItems.return_value.list.return_value.execute.side_effect = [
+        {"items": [item(2, "abcdefghijk"), item(0, "abcdefghijk")], "nextPageToken": "next"},
+        {"items": [item(3, "12345678901"), item(1, "ABCDEFGHIJK")]},
+    ]
+    result = YouTube(api=api, caller=Caller(0)).entries("PLsource")
+    assert [e.video_id for e in result] == [
+        "abcdefghijk",
+        "ABCDEFGHIJK",
+        "abcdefghijk",
+        "12345678901",
+    ]
+    assert [e.key for e in result] == ["entry-0", "entry-1", "entry-2", "entry-3"]
+
+
+def test_insert_sends_the_explicit_position():
+    api = MagicMock()
+    YouTube(api=api, caller=Caller(0)).add("PLtarget", "abcdefghijk", 7)
+    snippet = api.playlistItems.return_value.insert.call_args.kwargs["body"]["snippet"]
+    assert snippet["position"] == 7
+    assert snippet["resourceId"]["videoId"] == "abcdefghijk"
