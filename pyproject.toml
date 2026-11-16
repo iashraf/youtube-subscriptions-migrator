@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "youtube-migrator"
+version = "1.0.0"
+description = "Local, resumable YouTube and YouTube Music migration"
+requires-python = ">=3.12"
+dependencies = [
+  "google-api-python-client==2.187.0",
+  "google-auth==2.41.1",
+  "google-auth-httplib2==0.4.4",
+  "google-auth-oauthlib==1.2.3",
+  "httplib2==0.32.1",
+  "requests==2.34.2",
+  "ytmusicapi==1.12.3",
+  "typer==0.20.0",
+  "rich==14.2.0",
+]
+[project.optional-dependencies]
+dev = ["pytest==9.0.1", "ruff==0.14.5"]
+[project.scripts]
+migrator = "youtube_migrator.cli:app"
+[tool.setuptools.packages.find]
+where = ["src"]
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+[tool.ruff]
+line-length = 100
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
